@@ -15,6 +15,7 @@
 package hwaddr
 
 import (
+	"crypto/rand"
 	"fmt"
 	"net"
 )
@@ -60,4 +61,14 @@ func GenerateHardwareAddr4(ip net.IP, prefix []byte) (net.HardwareAddr, error) {
 			prefix,
 			ip[ipByteLen-ipRelevantByteLen:ipByteLen]...),
 	), nil
+}
+
+func GenerateRandomMac() net.HardwareAddr {
+	prefix := []byte{0x02, 0x00, 0x00} // local unicast prefix
+	suffix := make([]byte, 3)
+	_, err := rand.Read(suffix)
+	if err != nil {
+		panic(err)
+	}
+	return net.HardwareAddr(append(prefix, suffix...))
 }
