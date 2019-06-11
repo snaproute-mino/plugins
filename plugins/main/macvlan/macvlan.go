@@ -28,6 +28,7 @@ import (
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
+	"github.com/containernetworking/plugins/pkg/utils/hwaddr"
 	"github.com/containernetworking/plugins/pkg/utils/sysctl"
 	"github.com/j-keck/arping"
 	"github.com/vishvananda/netlink"
@@ -35,6 +36,7 @@ import (
 
 const (
 	IPv4InterfaceArpProxySysctlTemplate = "net.ipv4.conf.%s.proxy_arp"
+	macSetupRetries                     = 2
 )
 
 type NetConf struct {
@@ -106,9 +108,18 @@ func createMacvlan(conf *NetConf, ifName string, netns ns.NetNS) (*current.Inter
 		},
 		Mode: mode,
 	}
-
-	if err := netlink.LinkAdd(mv); err != nil {
-		return nil, fmt.Errorf("failed to create macvlan: %v", err)
+	// In case the MAC address is already assigned to another interface, retry
+	var containerMac net.HardwareAddr
+	for i := 0; i < macSetupRetries; i++ {
+		containerMac = hwaddr.GenerateRandomMac()
+		mv.LinkAttrs.HardwareAddr = containerMac
+		err := netlink.LinkAdd(mv)
+		if err == nil {
+			break
+		}
+		if err != nil && i == macSetupRetries {
+			return nil, fmt.Errorf("failed to create macvlan: %v", err)
+		}
 	}
 
 	err = netns.Do(func(_ ns.NetNS) error {
@@ -150,6 +161,8 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
+	isLayer3 := n.IPAM.Type != ""
+
 	netns, err := ns.GetNS(args.Netns)
 	if err != nil {
 		return fmt.Errorf("failed to open netns %q: %v", netns, err)
@@ -170,54 +183,66 @@ func cmdAdd(args *skel.CmdArgs) error {
 		}
 	}()
 
-	// run the IPAM plugin and get back the config to apply
-	r, err := ipam.ExecAdd(n.IPAM.Type, args.StdinData)
-	if err != nil {
-		return err
-	}
+	// Assume L2 interface only
+	result := &current.Result{CNIVersion: cniVersion, Interfaces: []*current.Interface{macvlanInterface}}
 
-	// Invoke ipam del if err to avoid ip leak
-	defer func() {
+	if isLayer3 {
+		// run the IPAM plugin and get back the config to apply
+		r, err := ipam.ExecAdd(n.IPAM.Type, args.StdinData)
 		if err != nil {
-			ipam.ExecDel(n.IPAM.Type, args.StdinData)
-		}
-	}()
-
-	// Convert whatever the IPAM result was into the current Result type
-	result, err := current.NewResultFromResult(r)
-	if err != nil {
-		return err
-	}
-
-	if len(result.IPs) == 0 {
-		return errors.New("IPAM plugin returned missing IP config")
-	}
-	result.Interfaces = []*current.Interface{macvlanInterface}
-
-	for _, ipc := range result.IPs {
-		// All addresses apply to the container macvlan interface
-		ipc.Interface = current.Int(0)
-	}
-
-	err = netns.Do(func(_ ns.NetNS) error {
-		if err := ipam.ConfigureIface(args.IfName, result); err != nil {
 			return err
 		}
 
-		contVeth, err := net.InterfaceByName(args.IfName)
+		// Invoke ipam del if err to avoid ip leak
+		defer func() {
+			if err != nil {
+				ipam.ExecDel(n.IPAM.Type, args.StdinData)
+			}
+		}()
+
+		// Convert whatever the IPAM result was into the current Result type
+		ipamResult, err := current.NewResultFromResult(r)
 		if err != nil {
-			return fmt.Errorf("failed to look up %q: %v", args.IfName, err)
+			return err
 		}
 
-		for _, ipc := range result.IPs {
-			if ipc.Version == "4" {
-				_ = arping.GratuitousArpOverIface(ipc.Address.IP, *contVeth)
-			}
+		result.IPs = ipamResult.IPs
+		result.Routes = ipamResult.Routes
+
+		if len(result.IPs) == 0 {
+			return errors.New("IPAM plugin returned missing IP config")
 		}
-		return nil
-	})
-	if err != nil {
-		return err
+
+		if len(result.IPs) == 0 {
+			return errors.New("IPAM plugin returned missing IP config")
+		}
+		// result.Interfaces = []*current.Interface{macvlanInterface}
+
+		for _, ipc := range result.IPs {
+			// All addresses apply to the container macvlan interface
+			ipc.Interface = current.Int(0)
+		}
+
+		err = netns.Do(func(_ ns.NetNS) error {
+			if err := ipam.ConfigureIface(args.IfName, result); err != nil {
+				return err
+			}
+
+			contVeth, err := net.InterfaceByName(args.IfName)
+			if err != nil {
+				return fmt.Errorf("failed to look up %q: %v", args.IfName, err)
+			}
+
+			for _, ipc := range result.IPs {
+				if ipc.Version == "4" {
+					_ = arping.GratuitousArpOverIface(ipc.Address.IP, *contVeth)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 	}
 
 	result.DNS = n.DNS
@@ -231,9 +256,13 @@ func cmdDel(args *skel.CmdArgs) error {
 		return err
 	}
 
-	err = ipam.ExecDel(n.IPAM.Type, args.StdinData)
-	if err != nil {
-		return err
+	isLayer3 := n.IPAM.Type != ""
+
+	if isLayer3 {
+		err = ipam.ExecDel(n.IPAM.Type, args.StdinData)
+		if err != nil {
+			return err
+		}
 	}
 
 	if args.Netns == "" {
