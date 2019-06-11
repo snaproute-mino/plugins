@@ -1,0 +1,16 @@
+apiVersion: skaffold/v1beta6
+kind: Config
+build:
+  tagPolicy:
+    envTemplate:
+      template: "{{.DOCKER_REGISTRY}}/{{.DOCKER_REPOSITORY}}/{{.IMAGE_NAME}}:{{ if .TAG }}{{.TAG}}{{ else }}dev{{ end}}"
+  artifacts:
+  - image: cni-plugins
+    context: ./
+    docker:
+      dockerfile: docker/cni-plugins/Dockerfile
+  local:
+    push: true
+deploy:
+  helm:
+    releases: []
