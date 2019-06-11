@@ -27,6 +27,8 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+const macSetupRetries = 2
+
 var (
 	ErrLinkNotFound = errors.New("link not found")
 )
@@ -40,9 +42,20 @@ func makeVethPair(name, peer string, mtu int) (netlink.Link, error) {
 		},
 		PeerName: peer,
 	}
-	if err := netlink.LinkAdd(veth); err != nil {
-		return nil, err
+	// In case the MAC address is already assigned to another interface, retry
+	var containerMac net.HardwareAddr
+	for i := 0; i < macSetupRetries; i++ {
+		containerMac = hwaddr.GenerateRandomMac()
+		veth.LinkAttrs.HardwareAddr = containerMac
+		err := netlink.LinkAdd(veth)
+		if err == nil {
+			break
+		}
+		if err != nil && i == macSetupRetries {
+			return nil, err
+		}
 	}
+
 	// Re-fetch the link to get its creation-time parameters, e.g. index and mac
 	veth2, err := netlink.LinkByName(name)
 	if err != nil {
